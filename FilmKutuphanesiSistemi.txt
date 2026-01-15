@@ -1,0 +1,174 @@
+import json
+import os
+from neo4j import GraphDatabase
+
+class SinemaSistemi:
+    def __init__(self, baglanti_adresi, kullanici_adi, sifre):
+        self._uri = baglanti_adresi
+        self._user = kullanici_adi
+        self._password = sifre
+        self.baglanti = None
+        self.aktif_film = None
+
+
+
+    def sisteme_baglan(self):
+        try:
+            self.baglanti = GraphDatabase.driver(self._uri, auth=(self._user, self._password))
+            self.baglanti.verify_connectivity()
+            return True
+        except Exception as e:
+            print(f"\nSunucuya ulaşılamadı. Hata: {e}")
+            return False
+
+    def baglantiyi_kes(self):
+        if self.baglanti is not None:
+            self.baglanti.close()
+
+    def film_ara_getir(self, aranan_kelime):
+        if len(aranan_kelime.strip()) == 0:
+            print("\nLütfen geçerli bir film ismi girin!")
+            return []
+        
+        oturum = self.baglanti.session()
+        sorgu_cumlesi = "MATCH (film:Movie) "
+        sorgu_cumlesi += "WHERE film.title CONTAINS $anahtar "
+        sorgu_cumlesi += "RETURN film.title AS baslik, film.released AS yil"
+        
+        sonuclar = oturum.run(sorgu_cumlesi, anahtar=aranan_kelime)
+        
+        liste = []
+        for kayit in sonuclar:
+            liste.append(kayit)
+        
+        oturum.close()
+        
+        if len(liste) == 0:
+            print("\nEşleşen bir kayıt bulunamadı.")
+        return liste
+
+    def detaylari_cek(self, film_adi):
+        with self.baglanti.session() as session:
+            sql_benzeri_sorgu = (
+                "MATCH (m:Movie {title: $t}) "
+                "OPTIONAL MATCH (y:Person)-[:DIRECTED]->(m) "
+                "OPTIONAL MATCH (o:Person)-[:ACTED_IN]->(m) "
+                "RETURN m.title AS t, m.released AS y, m.tagline AS tg, "
+                "collect(DISTINCT y.name) AS yonetmenler, "
+                "collect(DISTINCT o.name) AS oyuncular"
+            )
+            return session.run(sql_benzeri_sorgu, t=film_adi).single()
+
+    def json_disa_aktar(self, film_basligi):
+        if film_basligi is None:
+            print("\nÖnce film seçimi yapmalısınız!")
+            return
+
+        with self.baglanti.session() as session:
+            sorgu = (
+                "MATCH (m:Movie {title: $title}) "
+                "OPTIONAL MATCH (p:Person)-[rel]->(m) "
+                "WHERE type(rel) = 'ACTED_IN' OR type(rel) = 'DIRECTED' "
+                "RETURN m, collect(p) AS kisiler, collect(rel) AS iliskiler"
+            )
+            data_row = session.run(sorgu, title=film_basligi).single()
+            
+            dugumler = []
+            movie_node = data_row["m"]
+            dugumler.append({
+                "id": str(movie_node.element_id), 
+                "label": "Movie", 
+                "title": movie_node["title"]
+            })
+            
+            baglantilar = []
+            for p in data_row["kisiler"]:
+                dugumler.append({
+                    "id": str(p.element_id), 
+                    "label": "Person", 
+                    "name": p["name"]
+                })
+            
+            for r in data_row["iliskiler"]:
+                baglantilar.append({
+                    "source": str(r.start_node.element_id),
+                    "target": str(r.end_node.element_id),
+                    "type": str(r.type)
+                })
+
+            cikti_verisi = {"nodes": dugumler, "links": baglantilar}
+            
+            if not os.path.exists('cikti_dosyalari'):
+                os.makedirs('cikti_dosyalari')
+                
+            yol = 'cikti_dosyalari/film_grafigi.json'
+            with open(yol, 'w', encoding='utf-8') as dosya:
+                json.dump(cikti_verisi, dosya, ensure_ascii=False, indent=2)
+            print(f"\nDosya kaydedildi: {yol}")
+
+def uygulama_baslat():
+    servis = SinemaSistemi("bolt://localhost:7687", "neo4j", "MertEren123")
+    
+    if servis.sisteme_baglan() == False:
+        return
+
+    durum = True
+    while durum:
+        print("\n--- SİNEMA VERİTABANI ---")
+        print("1- Film Sorgula")
+        print("2- Seçili Filmin Detayları")
+        print("3- Grafik Verisini İndir (JSON)")
+        print("4- Sistemi Kapat")
+        
+        user_input = input("Yapmak istediğiniz işlem: ")
+
+        if user_input == '1':
+            aranacak = input("Film ismi giriniz: ")
+            bulunanlar = servis.film_ara_getir(aranacak)
+            if bulunanlar:
+                print("\nBulunan Kayıtlar:")
+                sayac = 1
+                for f in bulunanlar:
+                    print(f"{sayac}) {f['baslik']} [{f['yil']}]")
+                    sayac += 1
+                
+                try:
+                    secim = int(input("Seçmek istediğiniz numara: "))
+                    if 1 <= secim < sayac:
+                        servis.aktif_film = bulunanlar[secim-1]['baslik']
+                        print(f"Aktif seçim: {servis.aktif_film}")
+                    else:
+                        print("Hatalı liste numarası!")
+                except:
+                    print("Sadece rakam girilmelidir.")
+
+        elif user_input == '2':
+            if servis.aktif_film:
+                d = servis.detaylari_cek(servis.aktif_film)
+                print(f"\n>> {d['t']} FİLM BİLGİLERİ")
+                print(f"Yayın Yılı: {d['y']}")
+                print(f"Özet: {d.get('tg', 'Bilgi yok')}")
+                print(f"Yönetmen Listesi: {', '.join(d['yonetmenler'])}")
+                print(f"Başrol Oyuncuları: {', '.join(d['oyuncular'][:3])}")
+            else:
+                print("\nLütfen önce arama yaparak bir film seçin.")
+
+        elif user_input == '3':
+            servis.json_disa_aktar(servis.aktif_film)
+
+        elif user_input == '4':
+            print("Çıkış yapılıyor...")
+            servis.baglantiyi_kes()
+            durum = False
+        else:
+            print("Geçersiz işlem seçildi!")
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    uygulama_baslat()
